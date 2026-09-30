@@ -2,28 +2,30 @@ import telebot
 import yt_dlp
 import os
 import subprocess
-import whisper
 import uuid
 import asyncio
 import edge_tts
+from openai import OpenAI
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ទាញយក Telegram Token ពី Environment Variables របស់ Render ដោយសុវត្ថិភាព
+# ទាញយក Token និង API Key ពី Environment Variables របស់ Render
 TELEGRAM_TOKEN = os.environ.get("BOT_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 if not TELEGRAM_TOKEN:
     print("❌ កំហុស៖ រកមិនឃើញ BOT_TOKEN ក្នុង Environment Variables ទេ។")
+if not OPENAI_API_KEY:
+    print("❌ កំហុស៖ រកមិនឃើញ OPENAI_API_KEY ក្នុង Environment Variables ទេ។")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+client = OpenAI(api_key=OPENAI_API_KEY)
 user_sessions = {}
 
-print("🤖 កំពុងផ្ទុក AI Whisper (tiny Model)...")
-whisper_model = whisper.load_model("tiny")
-print("✅ AI Model រួចរាល់ហើយ!")
+print("🤖 Bot កំពុងដំណើរការជាមួយ OpenAI Whisper API...")
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "👋 សួស្តី! សូមផ្ញើ Link ឬ File វីដេអូមក បូតនឹងទាញយក Script ដើម (មាន Timestamp) ដើម្បីឱ្យអ្នកងាយស្រួលផ្ទៀងផ្ទាត់ និងកែសម្រួលដោយខ្លួនឯង។")
+    bot.reply_to(message, "👋 សួស្តី! សូមផ្ញើ Link ឬ File វីដេអូមក បូតនឹងប្រើប្រាស់ OpenAI Whisper API ដើម្បីទាញយក Script ដើម (មាន Timestamp) យ៉ាងឆាប់រហ័ស។")
 
 @bot.message_handler(content_types=['video'])
 def handle_uploaded_video(message):
@@ -76,14 +78,14 @@ def handle_text(message):
         except Exception as e:
             bot.reply_to(message, f"❌ ទាញយកមិនបានទេ៖ {e}")
     else:
-        bot.reply_to(message, "⚠️️ សូមផ្ញើ Link វីដេអូ ឬ File វីដេអូមក!")
+        bot.reply_to(message, "⚠️ សូមផ្ញើ Link វីដេអូ ឬ File វីដេអូមក!")
 
 def process_video_transcription(chat_id, message_id):
-    bot.edit_message_text("⏳ កំពុងប្រើប្រាស់ Whisper AI ទាញយក Script ដើម...", chat_id, message_id)
+    bot.edit_message_text("⏳ កំពុងប្រើប្រាស់ OpenAI Whisper API...", chat_id, message_id)
     run_transcription(chat_id)
 
 def process_video_transcription_new(chat_id):
-    sent_msg = bot.send_message(chat_id, "⏳ កំពុងប្រើប្រាស់ Whisper AI ទាញយក Script ដើម...")
+    sent_msg = bot.send_message(chat_id, "⏳ កំពុងប្រើប្រាស់ OpenAI Whisper API...")
     run_transcription(chat_id, sent_msg.message_id)
 
 def format_time(seconds):
@@ -103,14 +105,27 @@ def run_transcription(chat_id, message_id=None):
         subprocess.run(['ffmpeg', '-y', '-i', video_path, '-vn', '-acodec', 'libmp3lame', audio_path], 
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
-        result = whisper_model.transcribe(audio_path)
-        segments = result.get("segments", [])
+        # ហៅប្រើ OpenAI Whisper API តាមរយៈ Cloud
+        with open(audio_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="verbose_json"
+            )
+        
+        segments = getattr(transcript, "segments", [])
         
         full_script = ""
         for i, seg in enumerate(segments):
-            start_time = format_time(seg["start"])
-            end_time = format_time(seg["end"])
-            seg_text = seg["text"].strip()
+            # seg អាចជា dict ឬ object អាស្រ័យលើ version របស់ openai library
+            if isinstance(seg, dict):
+                start_time = format_time(seg.get("start", 0))
+                end_time = format_time(seg.get("end", 0))
+                seg_text = seg.get("text", "").strip()
+            else:
+                start_time = format_time(seg.start)
+                end_time = format_time(seg.end)
+                seg_text = seg.text.strip()
             
             default_role = "ស្រី" if i % 2 == 0 else "ប្រុស"
             full_script += f"[{default_role}]: {seg_text}  ({start_time} - {end_time})\n"
@@ -220,5 +235,5 @@ def callback_actions(call):
         except Exception as e:
             bot.send_message(chat_id, f"❌ មានបញ្ហា៖ {e}")
 
-print("🤖 Bot កំពុងដំណើរការ...")
+print("🤖 Bot កំពុងដំណើរការជាមួយ OpenAI API រួចរាល់!")
 bot.infinity_polling()
