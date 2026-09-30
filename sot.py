@@ -18,7 +18,7 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 user_sessions = {}
 
 print("🤖 កំពុងផ្ទុក AI Whisper (Small Model)...")
-whisper_model = whisper.load_model("small")
+whisper_model = whisper.load_model("tiny")
 print("✅ AI Model រួចរាល់ហើយ!")
 
 @bot.message_handler(commands=['start', 'help'])
