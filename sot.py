@@ -17,7 +17,7 @@ if not TELEGRAM_TOKEN:
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 user_sessions = {}
 
-print("🤖 កំពុងផ្ទុក AI Whisper (Small Model)...")
+print("🤖 កំពុងផ្ទុក AI Whisper (tiny Model)...")
 whisper_model = whisper.load_model("tiny")
 print("✅ AI Model រួចរាល់ហើយ!")
 
@@ -76,7 +76,7 @@ def handle_text(message):
         except Exception as e:
             bot.reply_to(message, f"❌ ទាញយកមិនបានទេ៖ {e}")
     else:
-        bot.reply_to(message, "⚠️ សូមផ្ញើ Link វីដេអូ ឬ File វីដេអូមក!")
+        bot.reply_to(message, "⚠️️ សូមផ្ញើ Link វីដេអូ ឬ File វីដេអូមក!")
 
 def process_video_transcription(chat_id, message_id):
     bot.edit_message_text("⏳ កំពុងប្រើប្រាស់ Whisper AI ទាញយក Script ដើម...", chat_id, message_id)
