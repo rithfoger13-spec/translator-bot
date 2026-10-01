@@ -1,4 +1,6 @@
-pyTelegramBotAPI
-yt-dlp
+gradio
 edge-tts
-openai
+groq
+moviepy
+torch
+easyocr
