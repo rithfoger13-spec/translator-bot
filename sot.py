@@ -1,239 +1,443 @@
-import telebot
-import yt_dlp
-import os
-import subprocess
-import uuid
-import asyncio
+# --- AI Video & Voice Dubbing Studio (Web & Tiny Model Edition) ---
+import gradio as gr
 import edge_tts
-from openai import OpenAI
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import asyncio
+import os
+import torch
+import easyocr
+from groq import Groq
 
-# ទាញយក Token និង API Key ពី Environment Variables របស់ Render
-TELEGRAM_TOKEN = os.environ.get("BOT_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# ទាញយក API Key ពី Environment Variables របស់ Render
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-if not TELEGRAM_TOKEN:
-    print("❌ កំហុស៖ រកមិនឃើញ BOT_TOKEN ក្នុង Environment Variables ទេ។")
-if not OPENAI_API_KEY:
-    print("❌ កំហុស៖ រកមិនឃើញ OPENAI_API_KEY ក្នុង Environment Variables ទេ។")
-
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
-client = OpenAI(api_key=OPENAI_API_KEY)
-user_sessions = {}
-
-print("🤖 Bot កំពុងដំណើរការជាមួយ OpenAI Whisper API...")
-
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    bot.reply_to(message, "👋 សួស្តី! សូមផ្ញើ Link ឬ File វីដេអូមក បូតនឹងប្រើប្រាស់ OpenAI Whisper API ដើម្បីទាញយក Script ដើម (មាន Timestamp) យ៉ាងឆាប់រហ័ស។")
-
-@bot.message_handler(content_types=['video'])
-def handle_uploaded_video(message):
-    sent_msg = bot.reply_to(message, "📥 កំពុងទទួលបានវីដេអូ...")
+from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
+try:
+    from moviepy.audio.fx.audio_speedx import audio_speedx
+except ImportError:
     try:
-        file_info = bot.get_file(message.video.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        local_path = "user_video.mp4"
-        with open(local_path, 'wb') as f:
-            f.write(downloaded_file)
-        
-        user_sessions[message.chat.id] = {"type": "file", "path": local_path}
-        process_video_transcription(message.chat.id, sent_msg.message_id)
-    except Exception as e:
-        bot.reply_to(message, f"❌ មានបញ្ហា៖ {e}")
+        from moviepy.audio.fx.all import audio_speedx
+    except ImportError:
+        audio_speedx = None
 
-@bot.message_handler(func=lambda message: True)
-def handle_text(message):
-    chat_id = message.chat.id
-    if user_sessions.get(chat_id, {}).get("state") == "waiting_for_edit":
-        new_script = message.text
-        user_sessions[chat_id]["translated_script"] = new_script
-        user_sessions[chat_id]["state"] = None
-        
-        markup = InlineKeyboardMarkup()
-        markup.add(
-            InlineKeyboardButton("🎙️ បម្លែងសំឡេង Edge AI & ដាក់ចូលវីដេអូ", callback_data="make_video")
-        )
-        bot.send_message(
-            chat_id,
-            f"✍️ **Script ដែលបានកែសម្រួល៖**\n\n{new_script}",
-            reply_markup=markup
-        )
-        return
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+USE_GPU_OCR = (DEVICE == "cuda")
+print(f"🚀 Initializing EasyOCR on {DEVICE.upper()} (GPU Enabled: {USE_GPU_OCR})...")
 
-    if message.text.startswith("http"):
-        sent_msg = bot.reply_to(message, "⏳ កំពុងទាញយកវីដេអូតាម Link...")
-        try:
-            local_path = "user_video.mp4"
-            if os.path.exists(local_path):
-                os.remove(local_path)
-                
-            ydl_opts = {'format': 'best[height<=720]/best', 'outtmpl': local_path}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([message.text])
-                
-            user_sessions[chat_id] = {"type": "url", "path": local_path}
-            bot.delete_message(chat_id, sent_msg.message_id)
-            process_video_transcription_new(chat_id)
-        except Exception as e:
-            bot.reply_to(message, f"❌ ទាញយកមិនបានទេ៖ {e}")
-    else:
-        bot.reply_to(message, "⚠️ សូមផ្ញើ Link វីដេអូ ឬ File វីដេអូមក!")
+ocr_reader = easyocr.Reader(['ch_sim'], gpu=USE_GPU_OCR)
 
-def process_video_transcription(chat_id, message_id):
-    bot.edit_message_text("⏳ កំពុងប្រើប្រាស់ OpenAI Whisper API...", chat_id, message_id)
-    run_transcription(chat_id)
+LANGUAGE_OPTIONS = {
+    "ខ្មែរ (Khmer)": {"code": "km", "voices": ["km-KH-SreymomNeural", "km-KH-PisethNeural"]},
+    "English": {"code": "en", "voices": ["en-US-AriaNeural", "en-US-GuyNeural"]},
+    "中文 Chinese": {"code": "zh-CN", "voices": ["zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural"]},
+    "Tiếng Việt Vietnamese": {"code": "vi", "voices": ["vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"]},
+}
+LANGUAGE_NAMES = list(LANGUAGE_OPTIONS.keys())
 
-def process_video_transcription_new(chat_id):
-    sent_msg = bot.send_message(chat_id, "⏳ កំពុងប្រើប្រាស់ OpenAI Whisper API...")
-    run_transcription(chat_id, sent_msg.message_id)
+GROQ_MODEL = "llama-3.1-8b-instant"
+groq_client = None
+USE_GROQ = False
 
-def format_time(seconds):
-    minutes = int(seconds // 60)
-    secs = int(seconds % 60)
-    return f"{minutes:02d}:{secs:02d}"
-
-def run_transcription(chat_id, message_id=None):
+clean_key = GROQ_API_KEY.strip().strip('"').strip("'")
+if clean_key:
     try:
-        session = user_sessions.get(chat_id, {})
-        video_path = session.get("path", "user_video.mp4")
-        audio_path = "audio.mp3"
-        
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-            
-        subprocess.run(['ffmpeg', '-y', '-i', video_path, '-vn', '-acodec', 'libmp3lame', audio_path], 
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        
-        # ហៅប្រើ OpenAI Whisper API តាមរយៈ Cloud
-        with open(audio_path, "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="verbose_json"
-            )
-        
-        segments = getattr(transcript, "segments", [])
-        
-        full_script = ""
-        for i, seg in enumerate(segments):
-            # seg អាចជា dict ឬ object អាស្រ័យលើ version របស់ openai library
-            if isinstance(seg, dict):
-                start_time = format_time(seg.get("start", 0))
-                end_time = format_time(seg.get("end", 0))
-                seg_text = seg.get("text", "").strip()
-            else:
-                start_time = format_time(seg.start)
-                end_time = format_time(seg.end)
-                seg_text = seg.text.strip()
-            
-            default_role = "ស្រី" if i % 2 == 0 else "ប្រុស"
-            full_script += f"[{default_role}]: {seg_text}  ({start_time} - {end_time})\n"
-            
-        user_sessions[chat_id]["translated_script"] = full_script
-        
-        markup = InlineKeyboardMarkup()
-        markup.add(
-            InlineKeyboardButton("🎙️ បម្លែងសំឡេង Edge AI & ដាក់ចូលវីដេអូ", callback_data="make_video"),
-            InlineKeyboardButton("❌ កែសម្រួល Script", callback_data="process_edit")
-        )
-        
-        bot.send_message(
-            chat_id,
-            f"📜 **Script ភាសាដើម (មាន Timestamp សម្រាប់ផ្ទៀងផ្ទាត់)：**\n\n{full_script}\n\n💡 *អ្នកអាចចុច 'កែសម្រួល' ដើម្បីបកប្រែ និងរៀបចំតួអង្គប្រុស-ស្រីដោយខ្លួនឯង!*",
-            reply_markup=markup
-        )
+        groq_client = Groq(api_key=clean_key)
+        USE_GROQ = True
+        print(f"✅ Groq ដំណើរការបានជោគជ័យ — ប្រើប្រាស់ model តូចលឿន: {GROQ_MODEL}")
     except Exception as e:
-        bot.send_message(chat_id, f"❌ កំហុសឆ្គង៖ {e}")
+        print(f"⚠️ Groq Client Init Error: {e}")
 
-async def generate_edge_audio(text, voice, output_file):
-    communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_file)
-
-@bot.callback_query_handler(func=lambda call: call.data in ["make_video", "process_edit"])
-def callback_actions(call):
-    chat_id = call.message.chat.id
+def translate_with_groq_llm(text, target_lang_name):
+    if not USE_GROQ or not text.strip():
+        return f"[未翻译] {text}"
     
-    if call.data == "process_edit":
-        bot.answer_callback_query(call.id, text="Edit Mode")
-        user_sessions[chat_id]["state"] = "waiting_for_edit"
-        bot.send_message(chat_id, "✍️ សូមផ្ញើ Script ដែលអ្នកបានបកប្រែ និងកែសម្រួលរួច (ទម្រង់ `[ស្រី]: ...` ឬ `[ប្រុស]: ...`) មកទីនេះ:")
-        
-    elif call.data == "make_video":
-        bot.answer_callback_query(call.id, text="កំពុងបង្កើតសំឡេង Edge AI...")
-        bot.send_message(chat_id, "🎬 កំពុងបង្កើតសំឡេង AI ប្រុស-ស្រី និងបញ្ចូលទៅក្នុងវីដេអូ... សូមរង់ចាំបន្តិច!")
-        
-        try:
-            session = user_sessions.get(chat_id, {})
-            script_text = session.get("translated_script", "")
-            video_path = session.get("path", "user_video.mp4")
-            
-            unique_id = str(uuid.uuid4())[:8]
-            lines = script_text.split('\n')
-            
-            audio_files = []
-            for idx, line in enumerate(lines):
-                if not line.strip():
-                    continue
-                
-                if "(" in line and ")" in line and "-" in line:
-                    line = line.split("(")[0].strip()
+    system_msg = (
+        f"You are a professional subtitle translator. Translate the given Chinese subtitle text "
+        f"accurately and naturally into fluent {target_lang_name}. "
+        "Provide ONLY the translated text in the target language script, with no explanations, no notes."
+    )
+    try:
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": text},
+            ],
+            model=GROQ_MODEL,
+            temperature=0.2,
+        )
+        return chat_completion.choices[0].message.content.strip()
+    except Exception as e:
+        return text
 
-                role = "ស្រី"
-                text_to_read = line
-                if "[ប្រុស]:" in line:
-                    role = "ប្រុស"
-                    text_to_read = line.replace("[ប្រុស]:", "").strip()
-                elif "[ស្រី]:" in line:
-                    role = "ស្រី"
-                    text_to_read = line.replace("[ស្រី]:", "").strip()
-                
-                if not text_to_read:
-                    continue
-                
-                temp_audio = f"temp_{unique_id}_{idx}.mp3"
-                voice_name = "km-KH-PisethNeural" if role == "ប្រុស" else "km-KH-SreymomNeural"
-                
-                asyncio.run(generate_edge_audio(text_to_read, voice_name, temp_audio))
-                
-                if os.path.exists(temp_audio):
-                    audio_files.append(temp_audio)
-            
-            concat_file = f"concat_list_{unique_id}.txt"
-            with open(concat_file, 'w', encoding='utf-8') as f:
-                for af in audio_files:
-                    f.write(f"file '{af}'\n")
-            
-            final_tts_audio = f"final_tts_{unique_id}.mp3"
-            concat_cmd = [
-                'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-                '-i', concat_file, '-c', 'copy', final_tts_audio
-            ]
-            subprocess.run(concat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
-            output_video = f"output_video_{unique_id}.mp4"
-            video_cmd = [
-                'ffmpeg', '-y', '-i', video_path, '-i', final_tts_audio,
-                '-c:v', 'libx264', '-crf', '28', '-preset', 'fast',
-                '-vf', 'scale=-2:720',
-                '-map', '0:v:0', '-map', '1:a:0',
-                '-shortest', output_video
-            ]
-            subprocess.run(video_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
-            bot.send_message(chat_id, "📤 កំពុងផ្ញើវីដេអូទៅកាន់ Telegram...")
-            with open(output_video, 'rb') as vid:
-                bot.send_video(chat_id, vid, caption="🎉 វីដេអូបែងចែកសំឡេង AI ប្រុស-ស្រី រួចរាល់ដោយជោគជ័យ!", timeout=120)
-                
-            for af in audio_files:
-                if os.path.exists(af):
-                    os.remove(af)
-            for f in [concat_file, final_tts_audio, output_video]:
-                if os.path.exists(f):
-                    os.remove(f)
-                
-        except Exception as e:
-            bot.send_message(chat_id, f"❌ មានបញ្ហា៖ {e}")
+def step1_extract_subtitles_and_translate(media_file, target_lang_name, progress=gr.Progress()):
+    if not media_file:
+        return "⚠️ សូមអបឡូតវីដេអូរឿងសិន!", "", []
+    if not USE_GROQ:
+        return "⚠️ សូមពិនិត្យមើល GROQ_API_KEY របស់អ្នកនៅលើ Render!", "", []
 
-print("🤖 Bot កំពុងដំណើរការជាមួយ OpenAI API រួចរាល់!")
-bot.infinity_polling()
+    try:
+        progress(0.1, desc="កំពុងបើកវីដេអូ...")
+        video_clip = VideoFileClip(media_file)
+        duration = video_clip.duration
+        
+        temp_audio = "extracted_audio.mp3"
+        video_clip.audio.write_audiofile(temp_audio, logger=None)
+
+        progress(0.2, desc="កំពុងអានអក្សរចិនពីវីដេអូ (OCR)...")
+        fps_sample = 1.0 
+        original_lines = []
+        translated_lines = []
+        timing = []
+        
+        current_time = 0.0
+        seen_texts = set()
+        
+        while current_time < duration:
+            frame = video_clip.get_frame(current_time)
+            results = ocr_reader.readtext(frame)
+            
+            frame_texts = []
+            for bbox, text, prob in results:
+                if prob > 0.3:
+                    y_coord = bbox[0][1]
+                    if y_coord > frame.shape[0] * 0.65:
+                        frame_texts.append(text)
+            
+            combined_text = "".join(frame_texts).strip()
+            if len(combined_text) > 1 and combined_text not in seen_texts:
+                seen_texts.add(combined_text)
+                start_t = max(0.0, current_time - 0.5)
+                end_t = min(duration, current_time + 0.5)
+                
+                original_lines.append(combined_text)
+                trans_text = translate_with_groq_llm(combined_text, target_lang_name)
+                translated_lines.append(trans_text)
+                timing.append([start_t, end_t])
+
+            current_time += fps_sample
+            progress(0.2 + (current_time / duration) * 0.6, desc=f"កំពុងអាន OCR ដល់វិនាទីទី {current_time:.1f}s...")
+
+        if os.path.exists(temp_audio):
+            os.remove(temp_audio)
+
+        if not original_lines:
+            return "❌ រកមិនឃើញអក្សរ Subtitle ក្នុងវីដេអូទេ!", "", []
+
+        progress(1.0, desc="✨ អាន និងបកប្រែជោគជ័យ!")
+        return "\n".join(original_lines), "\n".join(translated_lines), timing
+
+    except Exception as e:
+        return f"❌ កំហុស ៖ {str(e)}", "", []
+
+def step2_generate_dubbing(media_file, editable_script, target_lang_name, timing_state, progress=gr.Progress()):
+    if not media_file or not editable_script:
+        return "⚠️ ទាមទារវីដេអូ និង Script!", None, None
+    lang_info = LANGUAGE_OPTIONS.get(target_lang_name, LANGUAGE_OPTIONS["ខ្មែរ (Khmer)"])
+    voice = lang_info["voices"][0]
+    temp_files = []
+    
+    try:
+        lines = [l.strip() for l in editable_script.split("\n") if l.strip()]
+        use_timing = bool(timing_state) and len(timing_state) == len(lines)
+
+        async def generate_tts_files():
+            for idx, text in enumerate(lines):
+                if not text:
+                    temp_files.append(None)
+                    continue
+                temp_path = f"temp_line_{idx}.mp3"
+                try:
+                    communicate = edge_tts.Communicate(text, voice)
+                    await communicate.save(temp_path)
+                    temp_files.append(temp_path)
+                except Exception:
+                    temp_files.append(None)
+
+        progress(0.4, desc="កំពុងបង្កើតសំឡេងនិយាយ AI (Edge-TTS)...")
+        asyncio.run(generate_tts_files())
+        valid_files = [f for f in temp_files if f and os.path.exists(f)]
+        
+        if not valid_files:
+            return "❌ បរាជ័យក្នុងការបង្កើតសំឡេង!", None, None
+
+        progress(0.6, desc="កំពុងផ្គុំសំឡេង និងវីដេអូ...")
+        video_clip = VideoFileClip(media_file)
+        video_duration = video_clip.duration
+        
+        if use_timing:
+            positioned_clips = []
+            for idx, f in enumerate(temp_files):
+                if not f or not os.path.exists(f):
+                    continue
+                start_sec = timing_state[idx][0]
+                next_start = timing_state[idx + 1][0] if idx + 1 < len(timing_state) else video_duration
+                slot_duration = max(0.5, next_start - start_sec)
+                clip = AudioFileClip(f)
+                actual_duration = clip.duration
+                if audio_speedx and actual_duration > slot_duration:
+                    speed_factor = min(actual_duration / slot_duration, 1.8)
+                    clip = clip.fx(audio_speedx, speed_factor)
+                positioned_clips.append(clip.set_start(start_sec))
+            final_audio = CompositeAudioClip(positioned_clips).set_duration(video_duration)
+        else:
+            from moviepy.editor import concatenate_audioclips
+            clips = [AudioFileClip(f) for f in valid_files]
+            final_audio = concatenate_audioclips(clips)
+
+        output_audio = "dubbed_audio.mp3"
+        final_audio.write_audiofile(output_audio, fps=44100, logger=None)
+        
+        output_video = "dubbed_output_video.mp4"
+        final_video = video_clip.set_audio(AudioFileClip(output_audio))
+        final_video.write_videofile(
+            output_video, codec="libx264", audio_codec="aac", fps=video_clip.fps or 30, audio_fps=44100, preset="medium", logger=None
+        )
+        
+        progress(1.0, desc="✨ ជោគជ័យ ១០០%!")
+        return "✅ បង្កើតវីដេអូ និងសំឡេងជោគជ័យ!", output_audio, output_video
+    except Exception as e:
+        return f"❌ កំហុស ៖ {str(e)}", None, None
+
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🇰🇭 AI Video & Voice Dubbing Studio (Web Version)")
+    gr.Markdown("ប្រព័ន្ធបកប្រែវីដេអូរឿងចិន និងបង្កើតសំឡេងនិយាយជាភាសាខ្មែរ ២៤/៧!")
+    
+    timing_state = gr.State([])
+    with gr.Row():
+        with gr.Column():
+            media_input = gr.Video(label="📤 អបឡូតវីដេអូរឿងចិនរបស់អ្នក")
+            lang_dropdown = gr.Dropdown(choices=LANGUAGE_NAMES, value="ខ្មែរ (Khmer)", label="🎯 ភាសាគោលដៅ (Target Language)")
+            step1_btn = gr.Button("🚀 ជំហានទី ១: អានអក្សរ Subtitle ពីវីដេអូ + បកប្រែ", variant="secondary")
+        with gr.Column():
+            out_original = gr.Textbox(label="📝 អក្សរចិន OCR တွေ့ក្នុងវីដេអូ (Original)", lines=5)
+            editable_script_box = gr.Textbox(label="✍️ ជំហានទី ២: កែសម្រួល Script", lines=7, interactive=True)
+            step2_btn = gr.Button("✨ ជំហានទី ៣: បង្កើតសំឡេង និងវីដេអូចុងក្រោយ", variant="primary")
+            status_output = gr.Textbox(label="📊 ស្ថានភាព (Status)")
+            out_audio = gr.Audio(label="🎵 សំឡេងចេញជាភាសាខ្មែរ")
+            out_video = gr.Video(label="🎥 វីដេអូចុងក្រោយ")
+
+    step1_btn.click(fn=step1_extract_subtitles_and_translate, inputs=[media_input, lang_dropdown], outputs=[out_original, editable_script_box, timing_state])
+    step2_btn.click(fn=step2_generate_dubbing, inputs=[media_input, editable_script_box, lang_dropdown, timing_state], outputs=[status_output, out_audio, out_video])
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=7860)# --- AI Video & Voice Dubbing Studio (Web & Tiny Model Edition) ---
+import gradio as gr
+import edge_tts
+import asyncio
+import os
+import torch
+import easyocr
+from groq import Groq
+
+# ទាញយក API Key ពី Environment Variables របស់ Render
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
+from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
+try:
+    from moviepy.audio.fx.audio_speedx import audio_speedx
+except ImportError:
+    try:
+        from moviepy.audio.fx.all import audio_speedx
+    except ImportError:
+        audio_speedx = None
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+USE_GPU_OCR = (DEVICE == "cuda")
+print(f"🚀 Initializing EasyOCR on {DEVICE.upper()} (GPU Enabled: {USE_GPU_OCR})...")
+
+ocr_reader = easyocr.Reader(['ch_sim'], gpu=USE_GPU_OCR)
+
+LANGUAGE_OPTIONS = {
+    "ខ្មែរ (Khmer)": {"code": "km", "voices": ["km-KH-SreymomNeural", "km-KH-PisethNeural"]},
+    "English": {"code": "en", "voices": ["en-US-AriaNeural", "en-US-GuyNeural"]},
+    "中文 Chinese": {"code": "zh-CN", "voices": ["zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural"]},
+    "Tiếng Việt Vietnamese": {"code": "vi", "voices": ["vi-VN-HoaiMyNeural", "vi-VN-NamMinhNeural"]},
+}
+LANGUAGE_NAMES = list(LANGUAGE_OPTIONS.keys())
+
+GROQ_MODEL = "llama-3.1-8b-instant"
+groq_client = None
+USE_GROQ = False
+
+clean_key = GROQ_API_KEY.strip().strip('"').strip("'")
+if clean_key:
+    try:
+        groq_client = Groq(api_key=clean_key)
+        USE_GROQ = True
+        print(f"✅ Groq ដំណើរការបានជោគជ័យ — ប្រើប្រាស់ model តូចលឿន: {GROQ_MODEL}")
+    except Exception as e:
+        print(f"⚠️ Groq Client Init Error: {e}")
+
+def translate_with_groq_llm(text, target_lang_name):
+    if not USE_GROQ or not text.strip():
+        return f"[未翻译] {text}"
+    
+    system_msg = (
+        f"You are a professional subtitle translator. Translate the given Chinese subtitle text "
+        f"accurately and naturally into fluent {target_lang_name}. "
+        "Provide ONLY the translated text in the target language script, with no explanations, no notes."
+    )
+    try:
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": text},
+            ],
+            model=GROQ_MODEL,
+            temperature=0.2,
+        )
+        return chat_completion.choices[0].message.content.strip()
+    except Exception as e:
+        return text
+
+def step1_extract_subtitles_and_translate(media_file, target_lang_name, progress=gr.Progress()):
+    if not media_file:
+        return "⚠️ សូមអបឡូតវីដេអូរឿងសិន!", "", []
+    if not USE_GROQ:
+        return "⚠️ សូមពិនិត្យមើល GROQ_API_KEY របស់អ្នកនៅលើ Render!", "", []
+
+    try:
+        progress(0.1, desc="កំពុងបើកវីដេអូ...")
+        video_clip = VideoFileClip(media_file)
+        duration = video_clip.duration
+        
+        temp_audio = "extracted_audio.mp3"
+        video_clip.audio.write_audiofile(temp_audio, logger=None)
+
+        progress(0.2, desc="កំពុងអានអក្សរចិនពីវីដេអូ (OCR)...")
+        fps_sample = 1.0 
+        original_lines = []
+        translated_lines = []
+        timing = []
+        
+        current_time = 0.0
+        seen_texts = set()
+        
+        while current_time < duration:
+            frame = video_clip.get_frame(current_time)
+            results = ocr_reader.readtext(frame)
+            
+            frame_texts = []
+            for bbox, text, prob in results:
+                if prob > 0.3:
+                    y_coord = bbox[0][1]
+                    if y_coord > frame.shape[0] * 0.65:
+                        frame_texts.append(text)
+            
+            combined_text = "".join(frame_texts).strip()
+            if len(combined_text) > 1 and combined_text not in seen_texts:
+                seen_texts.add(combined_text)
+                start_t = max(0.0, current_time - 0.5)
+                end_t = min(duration, current_time + 0.5)
+                
+                original_lines.append(combined_text)
+                trans_text = translate_with_groq_llm(combined_text, target_lang_name)
+                translated_lines.append(trans_text)
+                timing.append([start_t, end_t])
+
+            current_time += fps_sample
+            progress(0.2 + (current_time / duration) * 0.6, desc=f"កំពុងអាន OCR ដល់វិនាទីទី {current_time:.1f}s...")
+
+        if os.path.exists(temp_audio):
+            os.remove(temp_audio)
+
+        if not original_lines:
+            return "❌ រកមិនឃើញអក្សរ Subtitle ក្នុងវីដេអូទេ!", "", []
+
+        progress(1.0, desc="✨ អាន និងបកប្រែជោគជ័យ!")
+        return "\n".join(original_lines), "\n".join(translated_lines), timing
+
+    except Exception as e:
+        return f"❌ កំហុស ៖ {str(e)}", "", []
+
+def step2_generate_dubbing(media_file, editable_script, target_lang_name, timing_state, progress=gr.Progress()):
+    if not media_file or not editable_script:
+        return "⚠️ ទាមទារវីដេអូ និង Script!", None, None
+    lang_info = LANGUAGE_OPTIONS.get(target_lang_name, LANGUAGE_OPTIONS["ខ្មែរ (Khmer)"])
+    voice = lang_info["voices"][0]
+    temp_files = []
+    
+    try:
+        lines = [l.strip() for l in editable_script.split("\n") if l.strip()]
+        use_timing = bool(timing_state) and len(timing_state) == len(lines)
+
+        async def generate_tts_files():
+            for idx, text in enumerate(lines):
+                if not text:
+                    temp_files.append(None)
+                    continue
+                temp_path = f"temp_line_{idx}.mp3"
+                try:
+                    communicate = edge_tts.Communicate(text, voice)
+                    await communicate.save(temp_path)
+                    temp_files.append(temp_path)
+                except Exception:
+                    temp_files.append(None)
+
+        progress(0.4, desc="កំពុងបង្កើតសំឡេងនិយាយ AI (Edge-TTS)...")
+        asyncio.run(generate_tts_files())
+        valid_files = [f for f in temp_files if f and os.path.exists(f)]
+        
+        if not valid_files:
+            return "❌ បរាជ័យក្នុងការបង្កើតសំឡេង!", None, None
+
+        progress(0.6, desc="កំពុងផ្គុំសំឡេង និងវីដេអូ...")
+        video_clip = VideoFileClip(media_file)
+        video_duration = video_clip.duration
+        
+        if use_timing:
+            positioned_clips = []
+            for idx, f in enumerate(temp_files):
+                if not f or not os.path.exists(f):
+                    continue
+                start_sec = timing_state[idx][0]
+                next_start = timing_state[idx + 1][0] if idx + 1 < len(timing_state) else video_duration
+                slot_duration = max(0.5, next_start - start_sec)
+                clip = AudioFileClip(f)
+                actual_duration = clip.duration
+                if audio_speedx and actual_duration > slot_duration:
+                    speed_factor = min(actual_duration / slot_duration, 1.8)
+                    clip = clip.fx(audio_speedx, speed_factor)
+                positioned_clips.append(clip.set_start(start_sec))
+            final_audio = CompositeAudioClip(positioned_clips).set_duration(video_duration)
+        else:
+            from moviepy.editor import concatenate_audioclips
+            clips = [AudioFileClip(f) for f in valid_files]
+            final_audio = concatenate_audioclips(clips)
+
+        output_audio = "dubbed_audio.mp3"
+        final_audio.write_audiofile(output_audio, fps=44100, logger=None)
+        
+        output_video = "dubbed_output_video.mp4"
+        final_video = video_clip.set_audio(AudioFileClip(output_audio))
+        final_video.write_videofile(
+            output_video, codec="libx264", audio_codec="aac", fps=video_clip.fps or 30, audio_fps=44100, preset="medium", logger=None
+        )
+        
+        progress(1.0, desc="✨ ជោគជ័យ ១០០%!")
+        return "✅ បង្កើតវីដេអូ និងសំឡេងជោគជ័យ!", output_audio, output_video
+    except Exception as e:
+        return f"❌ កំហុស ៖ {str(e)}", None, None
+
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🇰🇭 AI Video & Voice Dubbing Studio (Web Version)")
+    gr.Markdown("ប្រព័ន្ធបកប្រែវីដេអូរឿងចិន និងបង្កើតសំឡេងនិយាយជាភាសាខ្មែរ ២៤/៧!")
+    
+    timing_state = gr.State([])
+    with gr.Row():
+        with gr.Column():
+            media_input = gr.Video(label="📤 អបឡូតវីដេអូរឿងចិនរបស់អ្នក")
+            lang_dropdown = gr.Dropdown(choices=LANGUAGE_NAMES, value="ខ្មែរ (Khmer)", label="🎯 ភាសាគោលដៅ (Target Language)")
+            step1_btn = gr.Button("🚀 ជំហានទី ១: អានអក្សរ Subtitle ពីវីដេអូ + បកប្រែ", variant="secondary")
+        with gr.Column():
+            out_original = gr.Textbox(label="📝 អក្សរចិន OCR တွေ့ក្នុងវីដេអូ (Original)", lines=5)
+            editable_script_box = gr.Textbox(label="✍️ ជំហានទី ២: កែសម្រួល Script", lines=7, interactive=True)
+            step2_btn = gr.Button("✨ ជំហានទី ៣: បង្កើតសំឡេង និងវីដេអូចុងក្រោយ", variant="primary")
+            status_output = gr.Textbox(label="📊 ស្ថានភាព (Status)")
+            out_audio = gr.Audio(label="🎵 សំឡេងចេញជាភាសាខ្មែរ")
+            out_video = gr.Video(label="🎥 វីដេអូចុងក្រោយ")
+
+    step1_btn.click(fn=step1_extract_subtitles_and_translate, inputs=[media_input, lang_dropdown], outputs=[out_original, editable_script_box, timing_state])
+    step2_btn.click(fn=step2_generate_dubbing, inputs=[media_input, editable_script_box, lang_dropdown, timing_state], outputs=[status_output, out_audio, out_video])
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=7860)
