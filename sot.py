@@ -1,16 +1,14 @@
-# --- AI Web Video Dubbing Studio ---
+# --- AI Web Video Dubbing Studio (Clean Edition) ---
 import gradio as gr
 import edge_tts
 import asyncio
 import os
 from groq import Groq
+from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_audioclips
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-from moviepy.editor import VideoFileClip, AudioFileClip
-import pydub
-
-print("🚀 Initializing Web Dubbing Studio...")
+print("🚀 Initializing Clean Web Dubbing Studio...")
 
 LANGUAGE_OPTIONS = {
     "ខ្មែរ (Khmer)": {"code": "km", "voices": ["km-KH-SreymomNeural", "km-KH-PisethNeural"]},
@@ -58,7 +56,7 @@ def process_video_subtitles(media_file, target_lang_name, progress=gr.Progress()
     if not media_file:
         return "⚠️ សូមអបឡូតវីដេអូសិន!", "", []
     try:
-        progress(0.3, desc="កំពុងទាញយកសំឡេងពីវីដេអូ...")
+        progress(0.3, desc="កំពុងទាញយកអត្ថបទ...")
         sample_texts = [
             "Hello, welcome to the AI voice studio.",
             "This is a fast and easy tool for video dubbing.",
@@ -113,7 +111,6 @@ def generate_dubbing(media_file, editable_script, target_lang_name, timing_state
         progress(0.7, desc="កំពុងផ្គុំចូលវីដេអូ...")
         video_clip = VideoFileClip(media_file)
         
-        from moviepy.editor import concatenate_audioclips
         clips = [AudioFileClip(f) for f in valid_files]
         final_audio = concatenate_audioclips(clips)
 
@@ -133,7 +130,7 @@ def generate_dubbing(media_file, editable_script, target_lang_name, timing_state
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown("# 🇰🇭 AI Web Dubbing Studio")
-    gr.Markdown("ប្រព័ន្ធបង្កើតសំឡេង AI លើ Website ផ្ទាល់ រហ័ស និងងាយស្រួលប្រើប្រាស់!")
+    gr.Markdown("ប្រព័ន្ធបង្កើតសំឡេង AI លើ Website រហ័ស និងងាយស្រួល!")
     
     timing_state = gr.State([])
     with gr.Row():
