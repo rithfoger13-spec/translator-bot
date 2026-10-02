@@ -1,4 +1,5 @@
-gradio
-edge-tts
-groq
-moviepy
+gradio==4.44.1
+edge-tts==6.1.9
+groq==0.11.0
+moviepy==1.0.3
+proglog==0.1.10
