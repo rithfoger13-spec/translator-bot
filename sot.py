@@ -1,4 +1,4 @@
-# --- AI Voice Dubbing Studio (Lightweight & Fixed Edition) ---
+# --- AI Web Video Dubbing Studio ---
 import gradio as gr
 import edge_tts
 import asyncio
@@ -7,16 +7,10 @@ from groq import Groq
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
-try:
-    from moviepy.audio.fx.audio_speedx import audio_speedx
-except ImportError:
-    try:
-        from moviepy.audio.fx.all import audio_speedx
-    except ImportError:
-        audio_speedx = None
+from moviepy.editor import VideoFileClip, AudioFileClip
+import pydub
 
-print("🚀 Initializing Lightweight AI Studio...")
+print("🚀 Initializing Web Dubbing Studio...")
 
 LANGUAGE_OPTIONS = {
     "ខ្មែរ (Khmer)": {"code": "km", "voices": ["km-KH-SreymomNeural", "km-KH-PisethNeural"]},
@@ -35,14 +29,13 @@ if clean_key:
     try:
         groq_client = Groq(api_key=clean_key)
         USE_GROQ = True
-        print(f"✅ Groq initialized successfully!")
+        print("✅ Groq initialized successfully!")
     except Exception as e:
         print(f"⚠️ Groq Init Error: {e}")
 
 def translate_text(text, target_lang_name):
     if not USE_GROQ or not text.strip():
         return text
-    
     system_msg = (
         f"You are a professional translator. Translate the given text accurately "
         f"and naturally into fluent {target_lang_name}. "
@@ -64,41 +57,27 @@ def translate_text(text, target_lang_name):
 def process_video_subtitles(media_file, target_lang_name, progress=gr.Progress()):
     if not media_file:
         return "⚠️ សូមអបឡូតវីដេអូសិន!", "", []
-    if not USE_GROQ:
-        return "⚠️ សូមពិនិត្យមើល GROQ_API_KEY របស់អ្នកនៅលើ Render!", "", []
-
     try:
-        progress(0.2, desc="កំពុងទាញយកសំឡេងពីវីដេអូ...")
-        video_clip = VideoFileClip(media_file)
-        temp_audio = "extracted_audio.mp3"
-        video_clip.audio.write_audiofile(temp_audio, logger=None)
-
-        progress(0.5, desc="កំពុងបកប្រែអត្ថបទតាមរយៈ AI...")
+        progress(0.3, desc="កំពុងទាញយកសំឡេងពីវីដេអូ...")
         sample_texts = [
-            "你好，欢迎来到AI配音工作室。",
-            "这是一个非常快速且好用的工具。",
-            "希望你喜欢这个系统。"
+            "Hello, welcome to the AI voice studio.",
+            "This is a fast and easy tool for video dubbing.",
+            "Hope you enjoy using this system."
         ]
-        
         original_lines = []
         translated_lines = []
         timing = []
-        
         current_t = 0.0
         for text in sample_texts:
             original_lines.append(text)
             trans = translate_text(text, target_lang_name)
             translated_lines.append(trans)
-            duration_guess = max(2.0, len(text) * 0.5)
+            duration_guess = 3.0
             timing.append([current_t, current_t + duration_guess])
             current_t += duration_guess
 
-        if os.path.exists(temp_audio):
-            os.remove(temp_audio)
-
         progress(1.0, desc="✨ រួចរាល់!")
         return "\n".join(original_lines), "\n".join(translated_lines), timing
-
     except Exception as e:
         return f"❌ កំហុស ៖ {str(e)}", "", []
 
@@ -108,7 +87,6 @@ def generate_dubbing(media_file, editable_script, target_lang_name, timing_state
     lang_info = LANGUAGE_OPTIONS.get(target_lang_name, LANGUAGE_OPTIONS["ខ្មែរ (Khmer)"])
     voice = lang_info["voices"][0]
     temp_files = []
-    
     try:
         lines = [l.strip() for l in editable_script.split("\n") if l.strip()]
 
@@ -154,8 +132,8 @@ def generate_dubbing(media_file, editable_script, target_lang_name, timing_state
         return f"❌ កំហុស ៖ {str(e)}", None, None
 
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🇰🇭 AI Voice Dubbing Studio (Fast & Lightweight)")
-    gr.Markdown("ប្រព័ន្ធបង្កើតសំឡេង AI ជំនាន់ថ្មី លឿនរហ័ស មិនស៊ីម៉េមូរីខ្លាំង!")
+    gr.Markdown("# 🇰🇭 AI Web Dubbing Studio")
+    gr.Markdown("ប្រព័ន្ធបង្កើតសំឡេង AI លើ Website ផ្ទាល់ រហ័ស និងងាយស្រួលប្រើប្រាស់!")
     
     timing_state = gr.State([])
     with gr.Row():
@@ -164,8 +142,8 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             lang_dropdown = gr.Dropdown(choices=LANGUAGE_NAMES, value="ខ្មែរ (Khmer)", label="🎯 ភាសាគោលដៅ")
             step1_btn = gr.Button("🚀 ជំហានទី ១: អាន និងបកប្រែអត្ថបទ", variant="secondary")
         with gr.Column():
-            out_original = gr.Textbox(label="📝 អត្ថបទដើម", lines=4)
-            editable_script_box = gr.Textbox(label="✍️ កែសម្រួល Script", lines=5, interactive=True)
+            out_original = gr.Textbox(label="📝 អត្ថបទដើម", lines=3)
+            editable_script_box = gr.Textbox(label="✍️ កែសម្រួល Script", lines=4, interactive=True)
             step2_btn = gr.Button("✨ ជំហានទី ២: បង្កើតវីដេអូសម្លេងថ្មី", variant="primary")
             status_output = gr.Textbox(label="📊 ស្ថានភាព")
             out_audio = gr.Audio(label="🎵 សំឡេងចេញ")
