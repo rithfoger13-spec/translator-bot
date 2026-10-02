@@ -219,7 +219,8 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     step2_btn.click(fn=step2_generate_dubbing, inputs=[media_input, editable_script_box, lang_dropdown, timing_state], outputs=[status_output, out_audio, out_video])
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)# --- AI Video & Voice Dubbing Studio (Web & Tiny Model Edition) ---
+    port = int(os.environ.get("PORT", 7860))
+    demo.launch(server_name="0.0.0.0", server_port=port)
 import gradio as gr
 import edge_tts
 import asyncio
